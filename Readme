@@ -1,0 +1,316 @@
+// mpc_mission.cpp
+// Kich ban thich nghi khoi luong: drone mang binh nuoc dang can dan; cat canh A1 -> A, xa nuoc khi bay A -> B
+// (toc do khong doi), ha canh B -> B1.
+// MPC (TinyMPC) KHONG biet co binh: RLS uoc luong khoi luong online tu gia toc ke. Logic o mission.hpp / payload.hpp.
+//
+// Cach dung: mpc_mission duong_dan/quadcopter_tank.xml
+// Khi dong cua so: ghi mission_log.csv roi tu mo plot_mission.py.
+
+#define NSTATES 12
+#define NINPUTS 4
+#define NHORIZON 30
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <cfloat>
+#include <algorithm>
+#include <fstream>
+#include <string>
+#include <vector>
+
+#include <GLFW/glfw3.h>
+#include <mujoco/mujoco.h>
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+#include <tinympc/tiny_api.hpp>
+#include "quad_mpc.hpp"     // bo dieu khien dung chung voi mpc_benchmark.cpp
+#include "eval_tools.hpp"   // SolverStats
+#include "mission.hpp"     // kich ban A->B, binh nuoc
+
+// ----- Bien toan cuc MuJoCo -----
+mjModel* m = NULL;
+mjData*  d = NULL;
+mjvCamera cam;
+mjvOption opt;
+mjvScene  scn;
+mjrContext con;
+
+bool button_left = false, button_middle = false, button_right = false;
+double lastx = 0, lasty = 0;
+
+void mouse_button(GLFWwindow* window, int button, int act, int mods) {
+    ImGui_ImplGlfw_MouseButtonCallback(window, button, act, mods);
+    if (ImGui::GetIO().WantCaptureMouse) return;
+    button_left   = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT)  == GLFW_PRESS;
+    button_middle = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE)== GLFW_PRESS;
+    button_right  = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+    glfwGetCursorPos(window, &lastx, &lasty);
+}
+
+void mouse_move(GLFWwindow* window, double xpos, double ypos) {
+    ImGui_ImplGlfw_CursorPosCallback(window, xpos, ypos);
+    if (ImGui::GetIO().WantCaptureMouse) return;
+    if (!button_left && !button_middle && !button_right) return;
+    double dx = xpos - lastx, dy = ypos - lasty;
+    lastx = xpos; lasty = ypos;
+    int width, height;
+    glfwGetWindowSize(window, &width, &height);
+    bool mod_shift = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS;
+    mjtMouse action;
+    if (button_right)       action = mod_shift ? mjMOUSE_MOVE_H : mjMOUSE_MOVE_V;
+    else if (button_left)   action = mod_shift ? mjMOUSE_ROTATE_H : mjMOUSE_ROTATE_V;
+    else                    action = mjMOUSE_ZOOM;
+    mjv_moveCamera(m, action, dx / height, dy / height, &cam);
+}
+
+void scroll(GLFWwindow* window, double xoffset, double yoffset) {
+    ImGui_ImplGlfw_ScrollCallback(window, xoffset, yoffset);
+    if (ImGui::GetIO().WantCaptureMouse) return;
+    mjv_moveCamera(m, mjMOUSE_ZOOM, 0, -0.05 * yoffset, &cam);
+}
+
+void key_cb(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    ImGui_ImplGlfw_KeyCallback(window, key, scancode, action, mods);
+}
+
+void char_cb(GLFWwindow* window, unsigned int c) {
+    ImGui_ImplGlfw_CharCallback(window, c);
+}
+
+// ----- Ve duong bay A->B va 2 diem moc len canh 3D -----
+static void add_marker(mjvScene* s, int type, const double* a, const double* b, double w, const float* rgba) {
+    if (s->ngeom >= s->maxgeom) return;
+    mjvGeom* g = s->geoms + s->ngeom;
+    if (type == mjGEOM_CAPSULE) {
+        mjv_initGeom(g, mjGEOM_CAPSULE, nullptr, nullptr, nullptr, rgba);
+        mjv_connector(g, mjGEOM_CAPSULE, w, a, b);
+    } else {
+        double sz[3] = {w, w, w}, mat[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+        mjv_initGeom(g, mjGEOM_SPHERE, sz, a, mat, rgba);
+    }
+    g->category = mjCAT_DECOR;
+    s->ngeom++;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::printf("Cach dung: %s duong_dan_toi_quadcopter_tank.xml\n", argv[0]);
+        return 1;
+    }
+    char error[1000] = "";
+    m = mj_loadXML(argv[1], nullptr, error, sizeof(error));
+    if (!m) { std::printf("Loi nap model: %s\n", error); return 1; }
+    d = mj_makeData(m);
+
+    MpcOptions mopt;
+    mopt.use_rls = true;
+    mopt.use_observer = true;
+    ms::MissionSim sim(m, d, mopt);
+    if (!sim.ok) return 1;
+    QuadMPC& ctl = *sim.ctl;
+    std::printf("MPC chi biet khoi luong drone tran: %.1f g (binh 10 g khong duoc khai bao)\n", sim.nominal_mass() * 1000.0);
+
+    float vmax = (float)sim.P.vmax, amax = (float)sim.P.amax, water_g = (float)sim.P.water_g, rate = (float)sim.P.rate_gps;
+    bool ever_started = false, follow = false;
+    int speed_mult = 1;
+    const int HN = 240;
+    float h_iter[HN] = {0}, h_us[HN] = {0}, h_mass[HN] = {0}, h_est[HN] = {0};
+    int h_off = 0, frame = 0;
+    ms::Summary S;
+
+    // dat camera nhin toan canh duong bay
+    mj_forward(m, d);
+
+    if (!glfwInit()) { std::printf("Khong khoi tao duoc GLFW\n"); return 1; }
+    GLFWwindow* window = glfwCreateWindow(1400, 900, "Quadcopter TinyMPC - Thich nghi khoi luong (A -> B)", nullptr, nullptr);
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
+    glfwSetMouseButtonCallback(window, mouse_button);
+    glfwSetCursorPosCallback(window, mouse_move);
+    glfwSetScrollCallback(window, scroll);
+    glfwSetKeyCallback(window, key_cb);
+    glfwSetCharCallback(window, char_cb);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui_ImplGlfw_InitForOpenGL(window, false);
+    ImGui_ImplOpenGL3_Init("#version 130");
+
+    mjv_defaultCamera(&cam);
+    mjv_defaultOption(&opt);
+    mjv_defaultScene(&scn);
+    mjr_defaultContext(&con);
+    mjv_makeScene(m, &scn, 2000);
+    mjr_makeContext(m, &con, mjFONTSCALE_150);
+    cam.type = mjCAMERA_FREE;
+    cam.lookat[0] = 3.0; cam.lookat[1] = 2.5; cam.lookat[2] = 1.5;
+    cam.distance = 9.0; cam.azimuth = 215; cam.elevation = -30;
+
+    const ImGuiTableFlags tflags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp;
+    const char* phase_name[7] = {"Tren mat dat A1 (RLS hoi tu)", "Cat canh A1 -> A", "Giu tai A (chua xa nuoc)", "Bay A -> B (dang xa nuoc)", "Giu tai B", "Ha canh B -> B1", "Da ha canh o B1"};
+
+    while (!glfwWindowShouldClose(window)) {
+        if (sim.running) {
+            sim.advance(speed_mult / 60.0);
+            if (!sim.log.empty()) {
+                const ms::Row& r = sim.log.back();
+                h_iter[h_off] = (float)r.iter; h_us[h_off] = (float)r.us;
+                h_mass[h_off] = (float)r.mass_true_g; h_est[h_off] = (float)r.mass_est_g;
+                h_off = (h_off + 1) % HN;
+            }
+        }
+        if (follow) for (int i = 0; i < 3; i++) cam.lookat[i] = d->qpos[i];
+
+        int width, height;
+        glfwGetFramebufferSize(window, &width, &height);
+        mjrRect viewport = {0, 0, width, height};
+        mjv_updateScene(m, d, &opt, nullptr, &cam, mjCAT_ALL, &scn);
+        {
+            const float red[4] = {1.f, 0.3f, 0.2f, 0.9f}, grn[4] = {0.2f, 0.9f, 0.3f, 0.9f}, yel[4] = {1.f, 0.9f, 0.2f, 0.5f};
+            add_marker(&scn, mjGEOM_CAPSULE, sim.P.A, sim.P.B, 0.01, yel);
+            add_marker(&scn, mjGEOM_SPHERE, sim.P.A, nullptr, 0.06, grn);
+            add_marker(&scn, mjGEOM_SPHERE, sim.P.B, nullptr, 0.06, red);
+            add_marker(&scn, mjGEOM_CAPSULE, sim.P.A1, sim.P.A, 0.006, yel);
+            add_marker(&scn, mjGEOM_CAPSULE, sim.P.B, sim.P.B1, 0.006, yel);
+            add_marker(&scn, mjGEOM_SPHERE, sim.P.A1, nullptr, 0.04, grn);
+            add_marker(&scn, mjGEOM_SPHERE, sim.P.B1, nullptr, 0.04, red);
+        }
+        mjr_render(viewport, &scn, &con);
+
+        if (ever_started && (frame++ % 6 == 0)) S = sim.summarize();
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        // ================= Cua so 1: dieu khien =================
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(430, 0), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Dieu khien - Thich nghi khoi luong");
+        ImGui::Text("Cat canh A1 = (%.0f, %.0f, %.0f) -> A = (%.0f, %.0f, %.1f)", sim.P.A1[0], sim.P.A1[1], sim.P.A1[2], sim.P.A[0], sim.P.A[1], sim.P.A[2]);
+        ImGui::Text("Bay A -> B = (%.0f, %.0f, %.1f) (xa nuoc) -> ha canh B1 = (%.0f, %.0f, %.0f)", sim.P.B[0], sim.P.B[1], sim.P.B[2], sim.P.B1[0], sim.P.B1[1], sim.P.B1[2]);
+        ImGui::Text("Binh 5 x 4 x 2 cm: vo 2 g + nuoc toi da 8 g (gan cung, dung tam)");
+        ImGui::Separator();
+        ImGui::BeginDisabled(sim.running);
+        ImGui::SliderFloat("Toc do bay deu A -> B (m/s)", &vmax, 0.3f, 2.0f);
+        ImGui::SliderFloat("Gia toc tang/giam toc (m/s^2)", &amax, 0.2f, 1.5f);
+        ImGui::SliderFloat("Luong nuoc ban dau (g)", &water_g, 0.0f, 8.0f);
+        ImGui::Checkbox("Xa nuoc trong doan A -> B (khoi luong giam dan)", &sim.P.spray);
+        ImGui::BeginDisabled(!sim.P.spray);
+        ImGui::Checkbox("Tu chon luu luong de can nuoc luc toi B", &sim.P.auto_rate);
+        ImGui::BeginDisabled(sim.P.auto_rate);
+        ImGui::SliderFloat("Luu luong (g/s)", &rate, 0.1f, 3.0f);
+        ImGui::EndDisabled(); ImGui::EndDisabled();
+        ImGui::EndDisabled();
+        const double g = ctl.g;
+        ImGui::TextDisabled("Goc nghieng du kien khi tang toc ~ %.1f do", std::atan((double)amax / g) * 180.0 / 3.14159265358979);
+        ImGui::Separator();
+        ImGui::Checkbox("RLS: uoc luong khoi luong online", &ctl.opt.use_rls);
+        ImGui::Checkbox("Observer nhieu (offset-free MPC)", &ctl.opt.use_observer);
+        ImGui::SliderInt("Toc do mo phong (x thoi gian thuc)", &speed_mult, 1, 4);
+        ImGui::Checkbox("Camera bam theo drone", &follow);
+        ImGui::Separator();
+        if (ImGui::Button(sim.running ? "Chay lai tu dau" : "Bat dau bay", ImVec2(180, 30))) {
+            sim.P.vmax = vmax; sim.P.amax = amax; sim.P.water_g = water_g; sim.P.rate_gps = rate;
+            sim.start();
+            ever_started = true; S = ms::Summary();
+            std::fill(h_iter, h_iter + HN, 0.f); std::fill(h_us, h_us + HN, 0.f);
+            std::fill(h_mass, h_mass + HN, 0.f); std::fill(h_est, h_est + HN, 0.f); h_off = 0;
+        }
+        if (!ever_started) {
+            ImGui::TextDisabled("Bam 'Bat dau bay' de chay.");
+        } else if (!sim.log.empty()) {
+            const ms::Row& r = sim.log.back();
+            ImGui::Text("Trang thai: %s (t = %.2f s)", sim.finished ? "DA XONG" : phase_name[r.phase], r.t);
+            ImGui::Text("Vi tri: (%.2f, %.2f, %.2f) m | toc do %.2f / %.2f m/s", r.p[0], r.p[1], r.p[2], r.speed, r.speed_ref);
+            ImGui::Text("Sai so ngang duong: %.1f mm | doc duong: %.1f mm | nghieng %.1f do", r.cross * 1e3, r.along * 1e3, r.tilt);
+            ImGui::Separator();
+            ImGui::Text("Nuoc con: %.2f g | khoi luong that %.2f g | RLS uoc luong %.2f g (%+.2f%%)",
+                        r.water_g, r.mass_true_g, r.mass_est_g, 100.0 * (r.mass_est_g / r.mass_true_g - 1.0));
+            ImGui::Text("MPC ban dau chi biet %.1f g (khong co binh)", sim.nominal_mass() * 1000.0);
+            ImGui::PlotLines("##mt", h_mass, HN, h_off, "khoi luong that (g)", 28.f, 41.f, ImVec2(0, 50));
+            ImGui::PlotLines("##me", h_est, HN, h_off, "khoi luong RLS uoc luong (g)", 28.f, 41.f, ImVec2(0, 50));
+            ImGui::TextDisabled("Dong cua so mo phong de mo bieu do.");
+        }
+        ImGui::End();
+
+        // ================= Cua so 2: ket qua =================
+        ImGui::SetNextWindowPos(ImVec2(830, 10), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(560, 560), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Ket qua");
+        if (ImGui::CollapsingHeader("1. Bam quy dao A1 -> A -> B -> B1", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (S.n < 2) ImGui::TextDisabled("Chua co du lieu.");
+            else if (ImGui::BeginTable("trk", 2, tflags)) {
+                ImGui::TableSetupColumn("Chi tieu"); ImGui::TableSetupColumn("Gia tri"); ImGui::TableHeadersRow();
+                auto row = [&](const char* a, const char* fmt, double v) {
+                    ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(a);
+                    ImGui::TableNextColumn(); ImGui::Text(fmt, v);
+                };
+                row("Lech cuc dai khoi duong chuan (toan chuyen)", "%.2f mm", S.max_cross_mm);
+                row("Lech khoi duong chuan RMS", "%.2f mm", S.rms_cross_mm);
+                row("Sai so doc duong cuc dai", "%.1f mm", S.max_along_mm);
+                row("Lech do cao cuc dai (Oz)", "%.2f mm", S.max_ez_mm);
+                row("Toc do bay deu trung binh", "%.3f m/s", S.cruise_speed);
+                row("Goc nghieng cuc dai", "%.2f do", S.max_tilt);
+                if (sim.finished) row("Sai so vi tri tai B1 (ha canh)", "%.2f mm", S.end_err_mm);
+                ImGui::EndTable();
+            }
+        }
+        if (ImGui::CollapsingHeader("2. Thich nghi khoi luong (RLS)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (S.n < 2) ImGui::TextDisabled("Chua co du lieu.");
+            else if (ImGui::BeginTable("ms", 2, tflags)) {
+                ImGui::TableSetupColumn("Chi tieu"); ImGui::TableSetupColumn("Gia tri"); ImGui::TableHeadersRow();
+                auto row = [&](const char* a, const char* fmt, double v) {
+                    ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(a);
+                    ImGui::TableNextColumn(); ImGui::Text(fmt, v);
+                };
+                row("Thoi gian xac lap sai so khoi luong < 5%", "%.2f s", S.t_conv5);
+                row("Thoi gian xac lap sai so khoi luong < 2%", "%.2f s", S.t_conv2);
+                row("Sai so khoi luong cuc dai (tu luc roi A)", "%.2f %%", S.mass_err_max_pct);
+                row("Sai so khoi luong hien tai", "%+.2f %%", S.mass_err_now_pct);
+                row("Nuoc con lai thap nhat", "%.2f g", S.min_water_g);
+                ImGui::EndTable();
+            }
+        }
+        if (ImGui::CollapsingHeader("3. Bo giai ADMM", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ev::SolverStats st = ev::stats_of(ctl);
+            const double budget_us = ctl.opt.dt_mpc * 1e6;
+            ImGui::Text("Vong lap ADMM: hien tai %d | trung binh %.1f | lon nhat %d (gioi han %d)", ctl.last_iter, st.avg_iter, st.max_iter, ctl.opt.max_iter);
+            ImGui::Text("Chua hoi tu (cham tran): %ld / %ld lan giai", st.n_unconv, st.n);
+            ImGui::Text("Thoi gian giai: hien tai %.0f us | TB %.0f us | max %.0f us", ctl.last_solve_us, st.avg_us, st.max_us);
+            ImGui::Text("= %.1f%% / %.1f%% ngan sach %.0f ms (TB / max)", 100.0 * st.avg_us / budget_us, 100.0 * st.max_us / budget_us, budget_us / 1000.0);
+            ImGui::Text("Ty le tick co motor cham gioi han luc day: %.1f%%", 100.0 * st.frac_any_sat);
+            ImGui::PlotLines("##iter", h_iter, HN, h_off, "so vong ADMM (240 mau gan nhat)", 0.f, (float)ctl.opt.max_iter + 5.f, ImVec2(0, 60));
+            ImGui::PlotLines("##us", h_us, HN, h_off, "thoi gian giai (us)", 0.f, FLT_MAX, ImVec2(0, 60));
+        }
+        ImGui::End();
+
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    if (ever_started && !sim.log.empty()) {
+        sim.write_csv("mission_log.csv");
+        std::printf("Da luu mission_log.csv. Dang tu dong mo bieu do...\n");
+        int ret = std::system("python plot_mission.py mission_log.csv");
+        if (ret != 0) {
+            std::printf("Khong tu chay duoc script Python (ma loi %d).\n", ret);
+            std::printf("Chay tay bang lenh: python plot_mission.py mission_log.csv\n");
+        }
+    }
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    mjv_freeScene(&scn);
+    mjr_freeContext(&con);
+    mj_deleteData(d);
+    mj_deleteModel(m);
+    glfwTerminate();
+    return 0;
+}
